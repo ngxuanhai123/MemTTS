@@ -10,8 +10,8 @@
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/ngxuanhai123/MemTTS/refs/heads/main/TTS%20Vocabulary.js
-// @downloadURL  https://raw.githubusercontent.com/ngxuanhai123/MemTTS/refs/heads/main/TTS%20Vocabulary.js
+// @updateURL    https://raw.githubusercontent.com/ngxuanhai123/MemTTS/main/TTS%20Vocabulary.js
+// @downloadURL  https://raw.githubusercontent.com/ngxuanhai123/MemTTS/main/TTS%20Vocabulary.js
 // ==/UserScript==
 
 (function () {
