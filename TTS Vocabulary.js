@@ -1,28 +1,29 @@
 // ==UserScript==
 // @name         Memrise TTS Vocabulary Reader
 // @namespace    http://tampermonkey.net/
-// @version      3.6
-// @description  Đọc từ vựng bằng TTS trên Memrise - fix cắt đầu từ lần đầu + fix số voice hiển thị sai
-// @author       TTS Reader
+// @version      4.0
+// @description  Đọc từ vựng bằng TTS trên Memrise - Tự động nhận diện từ vựng (Auto-detect), chọn giọng đọc chất lượng cao, fix triệt để Chrome GC bug & tối ưu DOM
+// @author       TTS Reader & Claude
 // @match        https://community-courses.memrise.com/*
 // @match        https://*.memrise.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/ngxuanhai123/MemTTS/main/TTS%20Vocabulary.js
-// @downloadURL  https://raw.githubusercontent.com/ngxuanhai123/MemTTS/main/TTS%20Vocabulary.js
+// @updateURL    https://raw.githubusercontent.com/ngxuanhai123/MemTTS/refs/heads/main/TTS%20Vocabulary.js
+// @downloadURL  https://raw.githubusercontent.com/ngxuanhai123/MemTTS/refs/heads/main/TTS%20Vocabulary.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  // ─── CONFIG & STATE ───────────────────────────────────────────────
+  // ─── CONFIG & PERSISTENCE ──────────────────────────────────────────
   const STORAGE_KEY = 'memrise_tts_config';
 
-  let config = GM_getValue(STORAGE_KEY, {
+  const defaultConfig = {
     enabled: true,
     lang: 'en-US',
+    voiceName: '', // rỗng = tự động chọn giọng tốt nhất
     rate: 1.0,
     pitch: 1.0,
     volume: 1.0,
@@ -30,46 +31,72 @@
     savedSelectors: [],
     repeatCount: 0,
     repeatInterval: 3.0,
-    panelWidth: 310,
-    panelHeight: 520,
-  });
+    panelWidth: 320,
+    panelHeight: 560,
+  };
 
-  // Migrate: thêm trường mới nếu chưa có
-  if (!config.panelWidth)  config.panelWidth  = 310;
-  if (!config.panelHeight) config.panelHeight = 520;
+  let config = Object.assign({}, defaultConfig, GM_getValue(STORAGE_KEY, {}));
 
+  // Đảm bảo các trường luôn hợp lệ
+  if (!config.panelWidth  || config.panelWidth < 260)  config.panelWidth  = 320;
+  if (!config.panelHeight || config.panelHeight < 300) config.panelHeight = 560;
+  if (typeof config.voiceName !== 'string') config.voiceName = '';
+
+  function saveConfig() {
+    GM_setValue(STORAGE_KEY, config);
+  }
+
+  // ─── STATE VARIABLES ───────────────────────────────────────────────
   let isPickingMode = false;
   let highlightEl   = null;
   let autoReadTimer = null;
   let panelOpen     = false;
 
-  // Repeat state
+  // Trạng thái lặp lại
   let repeatRemaining   = 0;
   let repeatCurrentText = '';
   let repeatTimer       = null;
+  let progressAnimFrame = null;
+  let repeatStartTime   = 0;
+  let repeatTotalMs     = 0;
 
-  // Voice cache
-  const voiceCache   = new Map();
+  // Voices Cache & Engine
   let allVoicesCache = null;
-
-  // Change-detection state
-  let watchedText       = '';
-  let changeDetectTimer = null;
-
-  // ─────────────────────────────────────────────────────────────────
-  // GENERATION COUNTER — tránh callback cũ can thiệp.
-  // ─────────────────────────────────────────────────────────────────
-  let speakGen = 0;
-
-  // ─────────────────────────────────────────────────────────────────
-  // FIX #1 – ENGINE WARM-UP FLAG
-  // Chỉ warm-up 1 lần duy nhất khi voices sẵn sàng.
-  // ─────────────────────────────────────────────────────────────────
   let engineWarmedUp = false;
+  let speakGen = 0;
+  let lastSpokenText = '';
+  let watchedText = '';
 
-  function saveConfig() { GM_setValue(STORAGE_KEY, config); }
+  // Khắc phục Chromium GC bug 799003: Giữ tham chiếu toàn cục để V8 không thu hồi Utterance
+  const activeUtterances = new Set();
 
-  // ─── CSS ─────────────────────────────────────────────────────────
+  // ─── MEMRISE DEFAULT SELECTORS & SCORING ────────────────────────────
+  const MEMRISE_AUTO_SELECTORS = [
+    // === Modern Memrise (app.memrise.com / memrise.com) ===
+    { sel: '[data-testid="presentation-prompt"]', prio: 130 },
+    { sel: '[data-testid="test-prompt"]', prio: 125 },
+    { sel: '[data-testid*="prompt"]', prio: 120 },
+    { sel: 'h1[class*="lrnLearn_turnPromptWord"]', prio: 115 },
+    { sel: 'h2[class*="lrnLearn_turnPromptWord"]', prio: 115 },
+    { sel: 'div[class*="lrnLearn_turnWordBox"]', prio: 110 },
+    { sel: 'div[class*="lrnLearn_turnSideMainBox"]', prio: 105 },
+    { sel: 'div[class*="SpeedReview_turnWord"], div[class*="speedReview_turnWord"]', prio: 105 },
+    { sel: 'div[class*="turnPromptWord"]', prio: 100 },
+    { sel: '[data-testid*="word"]', prio: 95 },
+    { sel: 'div[class*="lrnPrompt"]', prio: 90 },
+
+    // === Classic Memrise (community-courses.memrise.com) ===
+    { sel: '.thing .text', prio: 110 },
+    { sel: '.prompt .text', prio: 105 },
+    { sel: '.col_a .text, .col-a .text', prio: 100 },
+    { sel: '.qquestion .text, .qtext', prio: 95 },
+    { sel: '.question-prompt .text', prio: 90 },
+    { sel: '.level-questions .question', prio: 85 },
+    { sel: '.speed-entry .cipher', prio: 85 },
+    { sel: '.presentation-card .text', prio: 80 },
+  ];
+
+  // ─── CSS STYLES ───────────────────────────────────────────────────
   GM_addStyle(`
     #mtr-fab {
       position:fixed; bottom:28px; right:28px; z-index:2147483647;
@@ -81,13 +108,13 @@
       transition:transform 0.2s,box-shadow 0.2s;
       font-size:22px; color:#fff; user-select:none;
     }
-    #mtr-fab:hover { transform:scale(1.1); box-shadow:0 6px 28px rgba(99,102,241,0.7); }
+    #mtr-fab:hover { transform:scale(1.08); box-shadow:0 6px 28px rgba(99,102,241,0.7); }
     #mtr-fab.disabled {
       background:linear-gradient(135deg,#64748b,#94a3b8);
       box-shadow:0 4px 16px rgba(100,116,139,0.4);
     }
     #mtr-fab .mtr-badge {
-      position:absolute; top:-4px; right:-4px;
+      position:absolute; top:-3px; right:-3px;
       width:14px; height:14px; background:#ef4444;
       border-radius:50%; border:2px solid #fff; display:none;
     }
@@ -97,29 +124,29 @@
       min-width:18px; height:18px; background:#10b981;
       border-radius:9px; border:2px solid #fff; display:none;
       align-items:center; justify-content:center;
-      font-size:9px; font-weight:700; color:#fff; padding:0 3px;
+      font-size:9px; font-weight:700; color:#fff; padding:0 4px;
     }
     #mtr-fab.repeating .mtr-repeat-badge { display:flex; }
     @keyframes mtr-changed-flash {
-      0%   { box-shadow:0 0 0 0  rgba(245,158,11,0.8); }
-      60%  { box-shadow:0 0 0 14px rgba(245,158,11,0);  }
-      100% { box-shadow:0 0 0 0  rgba(245,158,11,0);   }
+      0%   { box-shadow:0 0 0 0 rgba(245,158,11,0.8); }
+      60%  { box-shadow:0 0 0 14px rgba(245,158,11,0); }
+      100% { box-shadow:0 0 0 0 rgba(245,158,11,0); }
     }
     #mtr-fab.changed { animation:mtr-changed-flash 0.5s ease-out; }
 
     /* ── PANEL ── */
     #mtr-panel {
       position:fixed; bottom:92px; right:28px; z-index:2147483646;
-      width:310px; max-height:520px;
+      width:320px; max-height:560px;
       min-width:260px; max-width:680px;
       background:#0f172a;
-      border:1px solid rgba(99,102,241,0.3); border-radius:16px;
-      box-shadow:0 20px 60px rgba(0,0,0,0.6),0 0 0 1px rgba(255,255,255,0.04);
+      border:1px solid rgba(99,102,241,0.35); border-radius:16px;
+      box-shadow:0 20px 60px rgba(0,0,0,0.65),0 0 0 1px rgba(255,255,255,0.05);
       font-family:'Segoe UI',system-ui,sans-serif; color:#e2e8f0;
       overflow:hidden;
       transform-origin:bottom right;
-      transition:transform 0.25s cubic-bezier(.16,1,.3,1),opacity 0.2s;
-      transform:scale(0.85); opacity:0; pointer-events:none;
+      transition:transform 0.22s cubic-bezier(.16,1,.3,1),opacity 0.2s;
+      transform:scale(0.9); opacity:0; pointer-events:none;
       display:flex; flex-direction:column;
     }
     #mtr-panel.open { transform:scale(1); opacity:1; pointer-events:all; }
@@ -135,22 +162,22 @@
       content:'';
       margin:5px 0 0 5px;
       width:10px; height:10px;
-      border-left:2.5px solid rgba(99,102,241,0.45);
-      border-top:2.5px solid rgba(99,102,241,0.45);
+      border-left:2.5px solid rgba(99,102,241,0.5);
+      border-top:2.5px solid rgba(99,102,241,0.5);
       border-radius:3px 0 0 0;
       transition:border-color 0.15s;
     }
-    #mtr-resize-handle:hover::before { border-color:rgba(165,180,252,0.9); }
+    #mtr-resize-handle:hover::before { border-color:rgba(165,180,252,0.95); }
 
     #mtr-panel-header {
       display:flex; align-items:center; justify-content:space-between;
       padding:14px 18px 12px;
-      background:linear-gradient(135deg,rgba(99,102,241,0.15),rgba(139,92,246,0.1));
+      background:linear-gradient(135deg,rgba(99,102,241,0.18),rgba(139,92,246,0.12));
       border-bottom:1px solid rgba(255,255,255,0.06);
       flex-shrink:0;
     }
     #mtr-panel-header .title {
-      font-size:13px; font-weight:700; letter-spacing:0.06em;
+      font-size:13px; font-weight:700; letter-spacing:0.05em;
       text-transform:uppercase; color:#a5b4fc;
     }
     #mtr-panel-header .subtitle { font-size:11px; color:#64748b; margin-top:2px; }
@@ -167,7 +194,7 @@
     .mtr-row { display:flex; align-items:center; gap:8px; }
     .mtr-label {
       font-size:11px; color:#94a3b8; font-weight:600;
-      letter-spacing:0.04em; text-transform:uppercase; min-width:64px;
+      letter-spacing:0.04em; text-transform:uppercase; min-width:68px;
     }
     .mtr-switch { position:relative; width:38px; height:22px; flex-shrink:0; }
     .mtr-switch input { opacity:0; width:0; height:0; }
@@ -179,26 +206,27 @@
       content:''; position:absolute; width:16px; height:16px;
       left:2px; bottom:2px; border-radius:50%; background:#64748b; transition:0.2s;
     }
-    .mtr-switch input:checked + .mtr-slider { background:rgba(99,102,241,0.4); border-color:#6366f1; }
+    .mtr-switch input:checked + .mtr-slider { background:rgba(99,102,241,0.45); border-color:#6366f1; }
     .mtr-switch input:checked + .mtr-slider:before { transform:translateX(16px); background:#a5b4fc; }
     .mtr-select {
-      flex:1; background:#1e293b; border:1px solid rgba(255,255,255,0.08);
-      border-radius:8px; color:#e2e8f0; font-size:12px; padding:5px 8px;
-      outline:none; cursor:pointer;
+      flex:1; background:#1e293b; border:1px solid rgba(255,255,255,0.1);
+      border-radius:8px; color:#e2e8f0; font-size:12px; padding:6px 8px;
+      outline:none; cursor:pointer; font-family:inherit; min-width:0;
     }
     .mtr-select:focus { border-color:#6366f1; }
     .mtr-range { flex:1; accent-color:#6366f1; cursor:pointer; }
-    .mtr-range-val { font-size:11px; color:#a5b4fc; min-width:28px; text-align:right; }
+    .mtr-range-val { font-size:11px; color:#a5b4fc; min-width:32px; text-align:right; }
     .mtr-number {
-      width:52px; background:#1e293b; border:1px solid rgba(255,255,255,0.08);
+      width:54px; background:#1e293b; border:1px solid rgba(255,255,255,0.1);
       border-radius:8px; color:#e2e8f0; font-size:12px; padding:5px 8px;
-      outline:none; text-align:center; -moz-appearance:textfield;
+      outline:none; text-align:center; -moz-appearance:textfield; font-family:inherit;
     }
     .mtr-number::-webkit-outer-spin-button,
     .mtr-number::-webkit-inner-spin-button { -webkit-appearance:none; }
     .mtr-number:focus { border-color:#6366f1; }
+
     .mtr-repeat-section {
-      background:rgba(16,185,129,0.06); border:1px solid rgba(16,185,129,0.2);
+      background:rgba(16,185,129,0.06); border:1px solid rgba(16,185,129,0.22);
       border-radius:10px; padding:10px 12px; display:flex; flex-direction:column; gap:8px;
     }
     .mtr-repeat-section .mtr-section-title {
@@ -206,7 +234,7 @@
       text-transform:uppercase; display:flex; align-items:center; gap:6px;
     }
     .mtr-change-section {
-      background:rgba(245,158,11,0.06); border:1px solid rgba(245,158,11,0.2);
+      background:rgba(245,158,11,0.06); border:1px solid rgba(245,158,11,0.22);
       border-radius:10px; padding:10px 12px; display:flex; flex-direction:column; gap:8px;
     }
     .mtr-change-section .mtr-section-title {
@@ -218,6 +246,12 @@
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; transition:color 0.2s;
     }
     #mtr-current-word.active { color:#fbbf24; font-style:normal; font-weight:600; }
+    #mtr-detected-tag {
+      font-size:9px; background:rgba(99,102,241,0.2); color:#a5b4fc;
+      padding:2px 6px; border-radius:4px; border:1px solid rgba(99,102,241,0.3);
+      display:none;
+    }
+
     #mtr-repeat-progress-wrap { display:none; flex-direction:column; gap:4px; }
     #mtr-repeat-progress-wrap.active { display:flex; }
     #mtr-repeat-progress-bar-bg {
@@ -225,27 +259,28 @@
     }
     #mtr-repeat-progress-bar {
       height:100%; background:#10b981; border-radius:4px;
-      transition:width 0.3s linear; width:0%;
+      transition:width 0.25s linear; width:0%;
     }
     #mtr-repeat-progress-text { font-size:10px; color:#6ee7b7; text-align:right; }
     #mtr-btn-stop-repeat { display:none; }
     #mtr-btn-stop-repeat.active { display:flex; }
-    .mtr-divider { height:1px; background:rgba(255,255,255,0.05); margin:2px -4px; }
+    .mtr-divider { height:1px; background:rgba(255,255,255,0.06); margin:2px -4px; }
+
     #mtr-selector-list {
       display:flex; flex-direction:column; gap:6px;
-      max-height:160px; overflow-y:auto; padding-right:2px;
+      max-height:140px; overflow-y:auto; padding-right:2px;
     }
     #mtr-selector-list::-webkit-scrollbar { width:4px; }
     #mtr-selector-list::-webkit-scrollbar-track { background:transparent; }
     #mtr-selector-list::-webkit-scrollbar-thumb { background:#334155; border-radius:4px; }
     .mtr-selector-item {
       display:flex; align-items:center; gap:8px; background:#1e293b;
-      border-radius:8px; padding:7px 10px; border:1px solid rgba(255,255,255,0.05); font-size:12px;
+      border-radius:8px; padding:7px 10px; border:1px solid rgba(255,255,255,0.06); font-size:12px;
     }
     .mtr-selector-item .item-label { flex:1; color:#cbd5e1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .mtr-selector-item .item-selector {
       font-size:10px; color:#475569; font-family:monospace;
-      max-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      max-width:90px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
     }
     .mtr-selector-item .item-play {
       background:none; border:none; color:#6366f1; cursor:pointer;
@@ -257,21 +292,23 @@
       font-size:12px; padding:2px; border-radius:4px; transition:color 0.15s;
     }
     .mtr-selector-item .item-del:hover { color:#ef4444; }
-    .mtr-empty { font-size:11px; color:#475569; text-align:center; padding:12px 0; font-style:italic; }
+    .mtr-empty { font-size:11px; color:#64748b; text-align:center; padding:10px 0; font-style:italic; }
+
     .mtr-btn {
       display:flex; align-items:center; gap:6px;
-      background:rgba(99,102,241,0.15); border:1px solid rgba(99,102,241,0.3);
+      background:rgba(99,102,241,0.15); border:1px solid rgba(99,102,241,0.35);
       color:#a5b4fc; border-radius:8px; padding:7px 12px;
       font-size:12px; font-weight:600; cursor:pointer;
-      transition:background 0.15s,border-color 0.15s; user-select:none;
+      transition:background 0.15s,border-color 0.15s; user-select:none; font-family:inherit;
     }
-    .mtr-btn:hover { background:rgba(99,102,241,0.25); border-color:rgba(99,102,241,0.5); }
-    .mtr-btn.active { background:rgba(99,102,241,0.35); border-color:#6366f1; color:#c7d2fe; }
+    .mtr-btn:hover { background:rgba(99,102,241,0.25); border-color:rgba(99,102,241,0.55); }
+    .mtr-btn.active { background:rgba(99,102,241,0.4); border-color:#6366f1; color:#c7d2fe; }
     .mtr-btn.danger { background:rgba(239,68,68,0.1); border-color:rgba(239,68,68,0.3); color:#f87171; }
-    .mtr-btn.danger:hover { background:rgba(239,68,68,0.2); }
+    .mtr-btn.danger:hover { background:rgba(239,68,68,0.22); }
     .mtr-btn.green { background:rgba(16,185,129,0.15); border-color:rgba(16,185,129,0.3); color:#6ee7b7; }
     .mtr-btn.green:hover { background:rgba(16,185,129,0.25); }
     .mtr-btn-row { display:flex; gap:8px; flex-wrap:wrap; }
+
     #mtr-cache-status { font-size:10px; color:#475569; display:flex; align-items:center; gap:4px; }
     #mtr-cache-status .dot {
       width:6px; height:6px; border-radius:50%; background:#475569;
@@ -279,30 +316,32 @@
     }
     #mtr-cache-status.ready .dot { background:#10b981; }
     #mtr-cache-status.ready { color:#6ee7b7; }
+
     #mtr-toast {
-      position:fixed; bottom:100px; right:28px; z-index:2147483648;
+      position:fixed; bottom:96px; right:28px; z-index:2147483648;
       background:#1e293b; border:1px solid rgba(99,102,241,0.4); color:#a5b4fc;
       border-radius:10px; padding:8px 14px; font-size:12px;
       font-family:'Segoe UI',system-ui,sans-serif;
-      box-shadow:0 8px 24px rgba(0,0,0,0.4);
+      box-shadow:0 8px 24px rgba(0,0,0,0.45);
       opacity:0; pointer-events:none; transform:translateY(8px);
       transition:opacity 0.2s,transform 0.2s;
     }
     #mtr-toast.show { opacity:1; transform:translateY(0); }
+
     .mtr-pick-highlight {
       outline:2px dashed #f59e0b !important;
       outline-offset:2px !important;
-      background:rgba(245,158,11,0.08) !important;
+      background:rgba(245,158,11,0.1) !important;
       cursor:crosshair !important;
     }
     @keyframes mtr-pulse {
       0%,100% { box-shadow:0 4px 20px rgba(99,102,241,0.5); }
-      50%      { box-shadow:0 4px 30px rgba(99,102,241,0.9),0 0 0 8px rgba(99,102,241,0.15); }
+      50%     { box-shadow:0 4px 30px rgba(99,102,241,0.9),0 0 0 8px rgba(99,102,241,0.18); }
     }
     #mtr-fab.reading { animation:mtr-pulse 1s ease-in-out infinite; }
     @keyframes mtr-repeat-glow {
       0%,100% { box-shadow:0 4px 20px rgba(16,185,129,0.4); }
-      50%      { box-shadow:0 4px 28px rgba(16,185,129,0.8),0 0 0 6px rgba(16,185,129,0.12); }
+      50%     { box-shadow:0 4px 28px rgba(16,185,129,0.8),0 0 0 6px rgba(16,185,129,0.15); }
     }
     #mtr-fab.repeating:not(.reading) {
       animation:mtr-repeat-glow 2s ease-in-out infinite;
@@ -310,292 +349,124 @@
     }
   `);
 
-  // ─── DOM CREATION ────────────────────────────────────────────────
-  function createUI() {
-    const toast = document.createElement('div');
-    toast.id = 'mtr-toast';
-    document.body.appendChild(toast);
+  // ─── TEXT CLEANER & SANITIZER ───────────────────────────────────────
+  function sanitizeText(raw) {
+    if (!raw) return '';
+    let text = typeof raw === 'string' ? raw : (raw.innerText || raw.textContent || '');
+    text = text.replace(/\u00a0/g, ' ');
 
-    const fab = document.createElement('button');
-    fab.id = 'mtr-fab';
-    fab.title = 'Memrise TTS Reader';
-    fab.innerHTML = '🔊<span class="mtr-badge"></span><span class="mtr-repeat-badge" id="mtr-fab-repeat-count"></span>';
-    if (!config.enabled) fab.classList.add('disabled');
-    document.body.appendChild(fab);
+    // 1. Decode HTML entities
+    text = text
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, ' ');
 
-    const panel = document.createElement('div');
-    panel.id = 'mtr-panel';
-    panel.innerHTML = buildPanelHTML();
-    document.body.appendChild(panel);
+    // 2. Bỏ các emoji, icon loa phát âm thanh
+    text = text.replace(/[\u{1F50A}\u{1F50B}\u{1F508}\u{1F509}\u{1F507}\u{1F3A4}\u{1F3A7}\u{25B6}\u{25B8}\u{25C0}\u{23F5}]/gu, ' ');
 
-    // Khôi phục kích thước đã lưu
-    panel.style.width     = config.panelWidth  + 'px';
-    panel.style.maxHeight = config.panelHeight + 'px';
+    // 3. Bỏ phiên âm IPA trong [...] hoặc /.../
+    text = text.replace(/\[[^\]]*\]/g, ' ');
+    text = text.replace(/(^|[\s(])\/[^\n/]{1,40}\/(?=[\s).,!?]|$)/g, '$1 ');
 
-    return { fab, panel, toast };
+    // 4. Bỏ các nhãn từ loại trong ngoặc đơn
+    text = text.replace(/\s*\(\s*(?:noun|verb|adjective|adverb|pronoun|preposition|conjunction|interjection|phrase|idiom|n|v|adj|adv|prep|pron|conj|phr\s*v|vi|vt|slang|colloquial|formal|informal|uk|us|singular|plural)\.?\s*\)/gi, ' ');
+    text = text.replace(/\b(?:n|v|adj|adv|prep|pron|conj)\.?\s*:\s*/gi, ' ');
+
+    // 5. Bỏ số thứ tự đầu dòng / đầu text: "1. ", "2) ", "- ", "• "
+    text = text.replace(/^\s*(?:\d+[\.\)]|[-*•–—])\s+/gm, '');
+
+    // 6. Chuẩn hóa khoảng trắng và dấu câu thừa
+    text = text.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, ' ');
+    text = text.replace(/\s*,\s*,+/g, ',').trim();
+
+    return text;
   }
 
-  function buildPanelHTML() {
-    const langs = [
-      { code:'en-US', name:'🇺🇸 English (US)' },
-      { code:'en-GB', name:'🇬🇧 English (UK)' },
-      { code:'vi-VN', name:'🇻🇳 Tiếng Việt'  },
-      { code:'ja-JP', name:'🇯🇵 日本語'        },
-      { code:'ko-KR', name:'🇰🇷 한국어'         },
-      { code:'zh-CN', name:'🇨🇳 中文 (简体)'   },
-      { code:'zh-TW', name:'🇹🇼 中文 (繁體)'   },
-      { code:'fr-FR', name:'🇫🇷 Français'      },
-      { code:'de-DE', name:'🇩🇪 Deutsch'       },
-      { code:'es-ES', name:'🇪🇸 Español'       },
-      { code:'ru-RU', name:'🇷🇺 Русский'       },
-      { code:'id-ID', name:'🇮🇩 Bahasa Indonesia' },
-    ];
-    const langOptions = langs.map(l =>
-      `<option value="${l.code}" ${config.lang === l.code ? 'selected' : ''}>${l.name}</option>`
-    ).join('');
-
-    return `
-      <div id="mtr-resize-handle" title="Kéo để thay đổi kích thước panel"></div>
-      <div id="mtr-panel-header">
-        <div>
-          <div class="title">📖 Trình đọc TTS</div>
-          <div class="subtitle">Memrise Vocabulary Player</div>
-        </div>
-        <div id="mtr-cache-status" title="Trạng thái cache giọng đọc">
-          <span class="dot"></span>
-          <span id="mtr-cache-label">Đang tải voices...</span>
-        </div>
-      </div>
-      <div id="mtr-panel-body">
-        <div class="mtr-row">
-          <span class="mtr-label">Bật TTS</span>
-          <label class="mtr-switch">
-            <input type="checkbox" id="mtr-toggle-enabled" ${config.enabled ? 'checked' : ''}>
-            <span class="mtr-slider"></span>
-          </label>
-          <span class="mtr-label" style="min-width:auto;margin-left:12px">Tự đọc</span>
-          <label class="mtr-switch">
-            <input type="checkbox" id="mtr-toggle-auto" ${config.autoRead ? 'checked' : ''}>
-            <span class="mtr-slider"></span>
-          </label>
-        </div>
-        <div class="mtr-row">
-          <span class="mtr-label">Ngôn ngữ</span>
-          <select id="mtr-lang" class="mtr-select">${langOptions}</select>
-        </div>
-        <div class="mtr-row">
-          <span class="mtr-label">Tốc độ</span>
-          <input type="range" id="mtr-rate" class="mtr-range" min="0.5" max="2" step="0.1" value="${config.rate}">
-          <span class="mtr-range-val" id="mtr-rate-val">${config.rate}x</span>
-        </div>
-        <div class="mtr-row">
-          <span class="mtr-label">Cao độ</span>
-          <input type="range" id="mtr-pitch" class="mtr-range" min="0.5" max="2" step="0.1" value="${config.pitch}">
-          <span class="mtr-range-val" id="mtr-pitch-val">${config.pitch}</span>
-        </div>
-        <div class="mtr-divider"></div>
-        <div class="mtr-repeat-section">
-          <div class="mtr-section-title">🔁 Lặp lại tự động</div>
-          <div class="mtr-row" style="gap:10px;">
-            <span class="mtr-label" style="min-width:52px;">Số lần</span>
-            <input type="number" id="mtr-repeat-count" class="mtr-number" min="0" max="20" value="${config.repeatCount}" placeholder="0">
-            <span style="font-size:11px;color:#64748b;flex:1;">lần (0 = tắt)</span>
-          </div>
-          <div class="mtr-row" style="gap:10px;">
-            <span class="mtr-label" style="min-width:52px;">Cách nhau</span>
-            <input type="number" id="mtr-repeat-interval" class="mtr-number" min="0.1" max="60" step="0.1" value="${config.repeatInterval}" placeholder="3">
-            <span style="font-size:11px;color:#64748b;flex:1;">giây</span>
-          </div>
-          <div id="mtr-repeat-progress-wrap">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;">
-              <span style="font-size:10px;color:#6ee7b7;">Đang chờ đọc lại...</span>
-              <span id="mtr-repeat-progress-text" style="font-size:10px;color:#6ee7b7;"></span>
-            </div>
-            <div id="mtr-repeat-progress-bar-bg">
-              <div id="mtr-repeat-progress-bar"></div>
-            </div>
-          </div>
-          <button class="mtr-btn danger" id="mtr-btn-stop-repeat" style="width:100%;justify-content:center;">
-            ⏹ Dừng lặp lại
-          </button>
-        </div>
-        <div class="mtr-change-section">
-          <div class="mtr-section-title">⚡ Phát hiện từ mới</div>
-          <div style="font-size:11px;color:#92400e;line-height:1.5;">
-            Khi từ trên trang thay đổi, TTS sẽ dừng ngay và đọc từ mới.
-          </div>
-          <div style="display:flex;align-items:center;gap:8px;">
-            <span style="font-size:10px;color:#78716c;">Đang theo dõi:</span>
-            <span id="mtr-current-word">— chưa có từ —</span>
-          </div>
-        </div>
-        <div class="mtr-divider"></div>
-        <div style="font-size:11px;color:#94a3b8;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;">
-          📌 Vị trí từ đã lưu
-        </div>
-        <div id="mtr-selector-list"></div>
-        <div class="mtr-btn-row">
-          <button class="mtr-btn" id="mtr-btn-pick">✚ Chọn vị trí</button>
-          <button class="mtr-btn" id="mtr-btn-reread" title="Đọc lại từ vừa đọc (phím R)">🔁 Đọc lại</button>
-          <button class="mtr-btn danger" id="mtr-btn-clear">🗑 Xoá tất cả</button>
-        </div>
-        <div class="mtr-divider"></div>
-        <div style="font-size:11px;color:#94a3b8;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;">
-          🔈 Thử nghiệm TTS
-        </div>
-        <div class="mtr-row" style="gap:6px;">
-          <input id="mtr-test-input" type="text" placeholder="Nhập từ để thử..."
-            style="flex:1;background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:8px;
-            color:#e2e8f0;font-size:12px;padding:6px 10px;outline:none;font-family:inherit;">
-          <button class="mtr-btn" id="mtr-btn-test">▶</button>
-        </div>
-        <div style="font-size:10px;color:#334155;text-align:center;margin-top:4px;">
-          Kéo góc ↖ trên-trái để thay đổi kích thước
-        </div>
-      </div>
-    `;
+  // ─── SAFE EDITABLE FIELD DETECTION ──────────────────────────────────
+  function isEditableTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el.isContentEditable) return true;
+    if (el.getAttribute('role') === 'textbox') return true;
+    if (el.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]')) return true;
+    return false;
   }
 
-  function renderSelectorList() {
-    const list = document.getElementById('mtr-selector-list');
-    if (!list) return;
-    if (config.savedSelectors.length === 0) {
-      list.innerHTML = '<div class="mtr-empty">Chưa có vị trí nào. Nhấn "+ Chọn vị trí" để thêm.</div>';
-      return;
-    }
-    list.innerHTML = config.savedSelectors.map((s, i) => `
-      <div class="mtr-selector-item" data-index="${i}">
-        <div style="flex:1;min-width:0;">
-          <div class="item-label">📌 ${s.label}</div>
-          <div class="item-selector">${s.cssPath}</div>
-        </div>
-        <button class="item-play" title="Đọc ngay" data-index="${i}">▶</button>
-        <button class="item-del"  title="Xoá"      data-index="${i}">✕</button>
-      </div>
-    `).join('');
-
-    list.querySelectorAll('.item-play').forEach(btn => {
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        readSelector(config.savedSelectors[+btn.dataset.index]);
-      });
-    });
-    list.querySelectorAll('.item-del').forEach(btn => {
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        config.savedSelectors.splice(+btn.dataset.index, 1);
-        saveConfig();
-        renderSelectorList();
-        showToast('🗑 Đã xoá vị trí');
-      });
-    });
-  }
-
-  // ─── VOICE CACHE ─────────────────────────────────────────────────
-
-  // ─────────────────────────────────────────────────────────────────
-  // FIX #1 – WARM-UP ENGINE
-  //
-  // Vấn đề gốc: khi TTS chưa từng được gọi trong phiên này, trình
-  // duyệt cần ~50–150ms để acquire audio hardware stream. Nếu gọi
-  // speak() ngay lập tức, 50–150ms đầu tiên của audio bị drop →
-  // nghe như mất nửa đầu từ.
-  //
-  // Giải pháp: khi voices sẵn sàng, phát một utterance volume=0,
-  // rate=10 (siêu nhanh, không nghe thấy) để "warm up" audio pipeline.
-  // Sau đó khi người dùng trigger TTS thật, hardware đã sẵn sàng.
-  // ─────────────────────────────────────────────────────────────────
-  function warmUpEngine() {
-    if (engineWarmedUp) return;
-    engineWarmedUp = true;
-    // getVoicesReady() luôn resolve ngay (allVoicesCache đã có) khi gọi từ preWarmVoices
-    getVoicesReady().then(voices => {
-      const voice = getCachedVoice(voices, config.lang);
-      const u = new SpeechSynthesisUtterance('\u00A0'); // non-breaking space – siêu ngắn
-      u.volume = 0;   // hoàn toàn im lặng
-      u.rate   = 10;  // tốc độ tối đa → xong trong <20ms
-      u.lang   = config.lang;
-      if (voice) u.voice = voice;
-      try { window.speechSynthesis.speak(u); } catch (_) { /* bỏ qua nếu browser block */ }
-    });
-  }
-
-  // ─────────────────────────────────────────────────────────────────
-  // FIX #2 – VOICE COUNT SỐ HIỂN THỊ SAI
-  //
-  // Vấn đề gốc 1: { once: true } chỉ bắt lần đầu tiên voiceschanged.
-  // Chrome fire sự kiện này nhiều lần: đợt 1 là voices local, đợt 2
-  // là voices online (Neural, Premium…). Dùng { once: true } → chỉ
-  // thấy voices đợt 1 → số hiển thị thấp hơn thực tế.
-  //
-  // Vấn đề gốc 2: regex cũ xóa "Neural" / "Desktop" khỏi tên trước
-  // khi tạo dedup-key → "Microsoft Mark Neural" và "Microsoft Mark"
-  // bị merge thành 1 → mất voices, số hiển thị sai.
-  // ─────────────────────────────────────────────────────────────────
-  function preWarmVoices() {
-    function syncVoices() {
-      const raw = window.speechSynthesis.getVoices();
-      if (!raw.length) return;
-      const deduped = dedupeVoices(raw);
-      // Chỉ cập nhật khi số lượng thực sự thay đổi (tránh re-render thừa)
-      if (deduped.length === allVoicesCache?.length) return;
-      allVoicesCache = deduped;
-      invalidateVoiceCache();
-      updateCacheStatus(true);
-      warmUpEngine(); // prime audio hardware ngay khi voices ready
-    }
-    syncVoices(); // thử ngay (Firefox, Chrome load lần thứ 2+)
-    // KHÔNG dùng { once: true } – Chrome fire voiceschanged nhiều lần theo batch
-    window.speechSynthesis.addEventListener('voiceschanged', syncVoices);
-  }
-
-  function updateCacheStatus(ready) {
-    const el    = document.getElementById('mtr-cache-status');
-    const label = document.getElementById('mtr-cache-label');
-    if (!el || !label) return;
-    if (ready) { el.classList.add('ready'); label.textContent = `${allVoicesCache.length} voices sẵn sàng`; }
-    else        { el.classList.remove('ready'); label.textContent = 'Đang tải voices...'; }
-  }
-
-  function getVoicesReady() {
-    if (allVoicesCache?.length > 0) return Promise.resolve(allVoicesCache);
-    return new Promise(resolve => {
-      const v = window.speechSynthesis.getVoices();
-      if (v.length > 0) {
-        allVoicesCache = dedupeVoices(v);
-        invalidateVoiceCache();
-        resolve(allVoicesCache);
-        return;
+  // ─── SMART AUTO-DETECT SELECTOR & BEST NODE ─────────────────────────
+  function pickBestTextElement() {
+    // Ưu tiên 1: Saved Selectors do người dùng tự ghim
+    if (config.savedSelectors && config.savedSelectors.length > 0) {
+      for (const s of config.savedSelectors) {
+        try {
+          const el = document.querySelector(s.cssPath);
+          if (el) {
+            const text = sanitizeText(el);
+            if (text) return { el, text, isCustom: true, label: s.label };
+          }
+        } catch (_) {}
       }
-      // Dùng named handler để removeEventListener được khi đã resolve
-      function handler() {
-        const voices = window.speechSynthesis.getVoices();
-        if (!voices.length) return;
-        allVoicesCache = dedupeVoices(voices);
-        invalidateVoiceCache();
-        window.speechSynthesis.removeEventListener('voiceschanged', handler);
-        resolve(allVoicesCache);
+    }
+
+    // Ưu tiên 2: Tự động nhận diện theo danh sách selectors của Memrise
+    let best = null;
+    let bestScore = -1;
+    let bestText = '';
+
+    for (const item of MEMRISE_AUTO_SELECTORS) {
+      let nodes;
+      try { nodes = document.querySelectorAll(item.sel); } catch (_) { continue; }
+      if (!nodes || !nodes.length) continue;
+
+      for (const el of nodes) {
+        // Bỏ qua phần tử ẩn
+        if (el.offsetParent === null && el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+        const text = sanitizeText(el);
+        if (!text || text.length > 250) continue; // Từ vựng không thể quá 250 ký tự
+
+        let score = item.prio;
+        // Điểm thưởng nếu là phần tử lá (không chứa nút bấm, audio, input con)
+        if (!el.querySelector('button, [role="button"], audio, [class*="audio"], input, textarea')) {
+          score += 25;
+        }
+        // Điểm thưởng cho độ dài hợp lý của từ vựng
+        const wordCount = text.split(/\s+/).length;
+        if (wordCount <= 5) score += 20;
+        else if (wordCount <= 12) score += 10;
+
+        if (score > bestScore) {
+          best = el;
+          bestScore = score;
+          bestText = text;
+        }
       }
-      window.speechSynthesis.addEventListener('voiceschanged', handler);
-    });
+      if (best && bestScore >= 115) break; // Đã tìm thấy khớp chất lượng rất cao
+    }
+
+    if (best) {
+      return { el: best, text: bestText, isCustom: false, label: 'Tự động nhận diện' };
+    }
+
+    return { el: null, text: '', isCustom: false, label: '' };
   }
 
-  function getCachedVoice(voices, lang) {
-    if (voiceCache.has(lang)) return voiceCache.get(lang);
-    const match =
-      voices.find(v => v.lang === lang) ||
-      voices.find(v => v.lang.startsWith(lang.split('-')[0])) ||
-      null;
-    voiceCache.set(lang, match);
-    return match;
-  }
+  // ─── VOICE CACHE & HIGH-QUALITY VOICE SELECTION ─────────────────────
+  const VOICE_PRIORITY_PATTERNS = [
+    /natural/i,
+    /neural/i,
+    /online/i,
+    /google/i,
+    /enhanced/i,
+    /premium/i,
+    /zira|david|mark|jenny|guy|aria|sonia|hazel|george|susan|alex|samantha|daniel|karen/i,
+  ];
 
   function dedupeVoices(voices) {
     const seen = new Set();
     return voices.filter(v => {
-      // Dedup chỉ khi lang + name hoàn toàn giống nhau (true duplicates).
-      // KHÔNG chuẩn hóa tên – giữ lại "Neural", "Enhanced", "Premium", "Desktop"
-      // như các voice riêng biệt để tránh báo cáo sai số lượng.
       const key = `${v.lang}|${v.name}`;
       if (seen.has(key)) return false;
       seen.add(key);
@@ -603,9 +474,144 @@
     });
   }
 
-  function invalidateVoiceCache() { voiceCache.clear(); }
+  function sortVoicesByQuality(voices) {
+    return [...voices].sort((a, b) => {
+      const getPrio = (v) => {
+        const text = `${v.name} ${v.voiceURI || ''}`;
+        for (let i = 0; i < VOICE_PRIORITY_PATTERNS.length; i++) {
+          if (VOICE_PRIORITY_PATTERNS[i].test(text)) return i;
+        }
+        return VOICE_PRIORITY_PATTERNS.length + (v.localService ? 1 : 0);
+      };
+      const pa = getPrio(a);
+      const pb = getPrio(b);
+      if (pa !== pb) return pa - pb;
+      return a.name.localeCompare(b.name);
+    });
+  }
 
-  // ─── KEEP-ALIVE ───────────────────────────────────────────────────
+  function getVoicesForLang(lang = config.lang) {
+    if (!allVoicesCache || !allVoicesCache.length) {
+      allVoicesCache = dedupeVoices(window.speechSynthesis.getVoices());
+    }
+    const primary = lang.split('-')[0].toLowerCase();
+    const exact = lang.toLowerCase().replace('_', '-');
+
+    const matched = allVoicesCache.filter(v => {
+      if (!v.lang) return false;
+      const vLang = v.lang.toLowerCase().replace('_', '-');
+      return vLang === exact || vLang.startsWith(primary + '-');
+    });
+
+    return sortVoicesByQuality(matched);
+  }
+
+  function resolveVoice(lang, preferredVoiceName) {
+    const available = getVoicesForLang(lang);
+    if (!available.length) return null;
+
+    if (preferredVoiceName) {
+      const found = available.find(v => v.name === preferredVoiceName);
+      if (found) return found;
+    }
+    return available[0]; // Mặc định giọng có ưu tiên cao nhất
+  }
+
+  function getVoicesReady() {
+    if (allVoicesCache && allVoicesCache.length > 0) return Promise.resolve(allVoicesCache);
+    return new Promise(resolve => {
+      const v = window.speechSynthesis.getVoices();
+      if (v.length > 0) {
+        allVoicesCache = dedupeVoices(v);
+        resolve(allVoicesCache);
+        return;
+      }
+      function handler() {
+        const voices = window.speechSynthesis.getVoices();
+        if (!voices.length) return;
+        allVoicesCache = dedupeVoices(voices);
+        window.speechSynthesis.removeEventListener('voiceschanged', handler);
+        resolve(allVoicesCache);
+      }
+      window.speechSynthesis.addEventListener('voiceschanged', handler);
+    });
+  }
+
+  function preWarmVoices() {
+    function sync() {
+      const raw = window.speechSynthesis.getVoices();
+      if (!raw.length) return;
+      const deduped = dedupeVoices(raw);
+      if (deduped.length === allVoicesCache?.length) return;
+      allVoicesCache = deduped;
+      updateCacheStatus(true);
+      populateVoiceDropdown();
+      warmUpEngine();
+    }
+    sync();
+    window.speechSynthesis.addEventListener('voiceschanged', sync);
+  }
+
+  function updateCacheStatus(ready) {
+    const el = document.getElementById('mtr-cache-status');
+    const label = document.getElementById('mtr-cache-label');
+    if (!el || !label) return;
+    if (ready && allVoicesCache) {
+      el.classList.add('ready');
+      label.textContent = `${allVoicesCache.length} voices sẵn sàng`;
+    } else {
+      el.classList.remove('ready');
+      label.textContent = 'Đang tải voices...';
+    }
+  }
+
+  function populateVoiceDropdown() {
+    const select = document.getElementById('mtr-voice');
+    if (!select) return;
+
+    const currentVal = config.voiceName || '';
+    const voices = getVoicesForLang(config.lang);
+
+    let html = '<option value="">✨ Tự động (Giọng tốt nhất)</option>';
+    voices.forEach(v => {
+      const isOnline = !v.localService || /online|natural|neural/i.test(v.name);
+      const badge = isOnline ? ' ⭐' : '';
+      const selected = v.name === currentVal ? 'selected' : '';
+      html += `<option value="${escapeHTML(v.name)}" ${selected}>${escapeHTML(v.name)}${badge}</option>`;
+    });
+    select.innerHTML = html;
+  }
+
+  function escapeHTML(str) {
+    return str.replace(/[&<>'"]/g, tag => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      "'": '&#39;',
+      '"': '&quot;',
+    }[tag] || tag));
+  }
+
+  function warmUpEngine() {
+    if (engineWarmedUp) return;
+    engineWarmedUp = true;
+    getVoicesReady().then(() => {
+      const voice = resolveVoice(config.lang, config.voiceName);
+      const u = new SpeechSynthesisUtterance('\u00A0');
+      u.volume = 0;
+      u.rate = 10;
+      u.lang = config.lang;
+      if (voice) u.voice = voice;
+
+      activeUtterances.add(u);
+      u.onend = () => activeUtterances.delete(u);
+      u.onerror = () => activeUtterances.delete(u);
+
+      try { window.speechSynthesis.speak(u); } catch (_) {}
+    });
+  }
+
+  // ─── CHROME 15s KEEP-ALIVE ──────────────────────────────────────────
   let keepAliveTimer = null;
   function startKeepAlive() {
     stopKeepAlive();
@@ -616,67 +622,59 @@
       }
     }, 10000);
   }
-  function stopKeepAlive() { clearInterval(keepAliveTimer); keepAliveTimer = null; }
-
-  let lastSpokenText = '';
-
-  // ─────────────────────────────────────────────────────────────────
-  // FIX: Hàm flush đảm bảo cancel() hoàn toàn xong trước speak().
-  // ─────────────────────────────────────────────────────────────────
-  async function flushSynthesis(myGen) {
-    // Bước 1: delay tối thiểu sau cancel()
-    await new Promise(r => setTimeout(r, 120));
-    if (myGen !== speakGen) return false;
-
-    // Bước 2: poll cho đến khi synthesis thực sự dừng
-    const deadline = Date.now() + 600;
-    while (window.speechSynthesis.speaking && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 30));
-      if (myGen !== speakGen) return false;
+  function stopKeepAlive() {
+    if (keepAliveTimer) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = null;
     }
-    return myGen === speakGen;
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // CORE TTS ENGINE
-  // ─────────────────────────────────────────────────────────────────
+  // ─── CORE SPEECH SYNTHESIS ENGINE ───────────────────────────────────
   async function speak(text, force = false, _fromRepeat = false) {
-    if (!config.enabled || !text?.trim()) return;
-    text = text.trim();
+    if (!config.enabled || !text) return;
+    text = sanitizeText(text);
+    if (!text) return;
     if (!force && text === lastSpokenText) return;
 
     if (!_fromRepeat) stopRepeatCycle();
 
     speakGen++;
-    const myGen = speakGen;
+    const currentGen = speakGen;
 
+    // Hủy an toàn utterance cũ
+    if (window.speechSynthesis.paused) window.speechSynthesis.resume();
     window.speechSynthesis.cancel();
     stopKeepAlive();
 
-    const ok = await flushSynthesis(myGen);
-    if (!ok) return;
+    // Nhỏ gọn delay để browser giải phóng audio hardware
+    await new Promise(r => setTimeout(r, 60));
+    if (currentGen !== speakGen) return;
 
     const voices = await getVoicesReady();
-    if (myGen !== speakGen) return;
+    if (currentGen !== speakGen) return;
 
-    const voice = getCachedVoice(voices, config.lang);
+    const voice = resolveVoice(config.lang, config.voiceName);
     const fab = document.getElementById('mtr-fab');
 
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang   = config.lang;
-    utter.rate   = parseFloat(config.rate);
-    utter.pitch  = parseFloat(config.pitch);
-    utter.volume = parseFloat(config.volume);
+    utter.rate   = Math.max(0.5, Math.min(2.0, parseFloat(config.rate) || 1.0));
+    utter.pitch  = Math.max(0.5, Math.min(2.0, parseFloat(config.pitch) || 1.0));
+    utter.volume = Math.max(0.0, Math.min(1.0, parseFloat(config.volume) || 1.0));
     if (voice) utter.voice = voice;
 
+    // Khắc phục Chromium GC Bug 799003: Giữ tham chiếu mạnh
+    activeUtterances.add(utter);
+
     utter.onstart = () => {
-      if (myGen !== speakGen) return;
+      if (currentGen !== speakGen) return;
       fab?.classList.add('reading');
       startKeepAlive();
     };
 
     utter.onend = () => {
-      if (myGen !== speakGen) return;
+      activeUtterances.delete(utter);
+      if (currentGen !== speakGen) return;
       fab?.classList.remove('reading');
       stopKeepAlive();
       lastSpokenText = text;
@@ -684,36 +682,56 @@
     };
 
     utter.onerror = (e) => {
-      if (myGen !== speakGen) return;
+      activeUtterances.delete(utter);
+      if (currentGen !== speakGen) return;
       fab?.classList.remove('reading');
       stopKeepAlive();
-      if (e.error !== 'interrupted') {
+      if (e.error !== 'interrupted' && e.error !== 'canceled') {
         lastSpokenText = '';
         stopRepeatCycle();
       }
     };
 
-    if (myGen !== speakGen) return;
+    if (currentGen !== speakGen) return;
 
-    // ─────────────────────────────────────────────────────────────
-    // FIX #1 (tiếp) – resume() ngay trước speak()
-    //
-    // Sau cancel(), engine có thể ở trạng thái "paused" nội bộ trên
-    // một số trình duyệt/OS. Gọi resume() trước speak() đảm bảo
-    // engine ở trạng thái "playing" sẵn sàng → không cắt đầu từ.
-    // ─────────────────────────────────────────────────────────────
-    window.speechSynthesis.resume();
-    window.speechSynthesis.speak(utter);
+    // Đảm bảo không bị kẹt ở trạng thái paused trước khi speak
+    if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+    try {
+      window.speechSynthesis.speak(utter);
+    } catch (_) {}
   }
 
-  // ─── REPEAT CYCLE ────────────────────────────────────────────────
-  let progressAnimFrame = null;
-  let repeatStartTime   = 0;
-  let repeatTotalMs     = 0;
+  function speakWithRepeat(text, force = false, _fromRepeat = false) {
+    if (!_fromRepeat) {
+      stopRepeatCycle();
+      if (config.repeatCount > 0) {
+        repeatRemaining = config.repeatCount;
+        repeatCurrentText = text;
+      }
+    }
+    return speak(text, force, _fromRepeat);
+  }
 
+  function stopAllSpeech() {
+    speakGen++;
+    window.speechSynthesis.cancel();
+    stopRepeatCycle();
+    stopKeepAlive();
+    activeUtterances.clear();
+    const fab = document.getElementById('mtr-fab');
+    fab?.classList.remove('reading');
+  }
+
+  // ─── REPEAT SCHEDULER ──────────────────────────────────────────────
   function scheduleNextRepeat(text) {
-    if (config.repeatCount === 0 || repeatRemaining <= 0) { stopRepeatCycle(); return; }
-    if (watchedText && text !== watchedText) { stopRepeatCycle(); return; }
+    if (config.repeatCount === 0 || repeatRemaining <= 0) {
+      stopRepeatCycle();
+      return;
+    }
+    if (watchedText && text !== watchedText) {
+      stopRepeatCycle();
+      return;
+    }
 
     const fab = document.getElementById('mtr-fab');
     fab?.classList.add('repeating');
@@ -721,7 +739,7 @@
     showRepeatProgress(true);
 
     repeatStartTime = Date.now();
-    repeatTotalMs   = config.repeatInterval * 1000;
+    repeatTotalMs   = (parseFloat(config.repeatInterval) || 3.0) * 1000;
 
     function animProgress() {
       const elapsed = Date.now() - repeatStartTime;
@@ -731,13 +749,16 @@
       if (bar) bar.style.width = pct + '%';
       if (txt) {
         const rem = Math.max(0, repeatTotalMs - elapsed);
-        txt.textContent = `còn ${rem < 1000 ? `${Math.round(rem)}ms` : `${Math.ceil(rem/1000)}s`} · lần ${repeatRemaining}`;
+        txt.textContent = `còn ${rem < 1000 ? `${Math.round(rem)}ms` : `${Math.ceil(rem / 1000)}s`} · lần ${repeatRemaining}`;
       }
-      if (elapsed < repeatTotalMs) progressAnimFrame = requestAnimationFrame(animProgress);
+      if (elapsed < repeatTotalMs) {
+        progressAnimFrame = requestAnimationFrame(animProgress);
+      }
     }
     cancelAnimationFrame(progressAnimFrame);
     progressAnimFrame = requestAnimationFrame(animProgress);
 
+    clearTimeout(repeatTimer);
     repeatTimer = setTimeout(() => {
       cancelAnimationFrame(progressAnimFrame);
       repeatRemaining--;
@@ -774,32 +795,21 @@
     }
   }
 
-  function speakWithRepeat(text, force = false, _fromRepeat = false) {
-    if (!_fromRepeat) {
-      stopRepeatCycle();
-      if (config.repeatCount > 0) {
-        repeatRemaining   = config.repeatCount;
-        repeatCurrentText = text;
-      }
-    }
-    return speak(text, force, true);
-  }
-
   function reReadLast() {
     if (lastSpokenText) {
       speakWithRepeat(lastSpokenText, true);
     } else {
-      for (const s of config.savedSelectors) {
-        const el = document.querySelector(s.cssPath);
-        const text = el && (el.innerText || el.textContent || '').trim();
-        if (text) { speakWithRepeat(text, true); showToast('🔁 Đọc lại: ' + text.slice(0, 30)); break; }
+      const { text } = pickBestTextElement();
+      if (text) {
+        speakWithRepeat(text, true);
+        showToast('🔁 Đọc lại: ' + text.slice(0, 30));
       }
     }
   }
 
   function readSelector(selectorObj) {
     const el = document.querySelector(selectorObj.cssPath);
-    const text = el && (el.innerText || el.textContent || '').trim();
+    const text = el ? sanitizeText(el) : '';
     if (text) {
       showToast(`🔊 Đọc: "${text.slice(0, 40)}"`);
       speakWithRepeat(text, true);
@@ -808,7 +818,107 @@
     }
   }
 
-  // ─── CSS PATH GENERATOR ──────────────────────────────────────────
+  // ─── CHANGE DETECTION & MUTATION THROTTLING ─────────────────────────
+  function updateWatchedWordDisplay(text, label) {
+    const el = document.getElementById('mtr-current-word');
+    const tag = document.getElementById('mtr-detected-tag');
+    if (!el) return;
+    if (text) {
+      el.textContent = `"${text.slice(0, 40)}"`;
+      el.classList.add('active');
+      if (tag && label) {
+        tag.textContent = label;
+        tag.style.display = 'inline-block';
+      }
+    } else {
+      el.textContent = '— chưa có từ —';
+      el.classList.remove('active');
+      if (tag) tag.style.display = 'none';
+    }
+  }
+
+  function flashChangedFab() {
+    const fab = document.getElementById('mtr-fab');
+    if (!fab) return;
+    fab.classList.remove('changed');
+    void fab.offsetWidth;
+    fab.classList.add('changed');
+    setTimeout(() => fab.classList.remove('changed'), 600);
+  }
+
+  function checkAndReadNewWord() {
+    if (!config.enabled || !config.autoRead) return;
+    const { text, label } = pickBestTextElement();
+    if (!text || text === watchedText) return;
+
+    watchedText = text;
+    updateWatchedWordDisplay(text, label);
+    flashChangedFab();
+
+    clearTimeout(autoReadTimer);
+    autoReadTimer = setTimeout(() => {
+      const current = pickBestTextElement();
+      if (!current.text) return;
+      if (current.text !== watchedText) {
+        watchedText = current.text;
+        updateWatchedWordDisplay(current.text, current.label);
+      }
+      speakWithRepeat(current.text, true);
+    }, 120);
+  }
+
+  // Tối ưu hóa: gom mutations bằng requestAnimationFrame + debounce 120ms
+  let rafScheduled = false;
+  let mutationDebounceTimer = null;
+
+  function onDOMMutation() {
+    if (!config.enabled || !config.autoRead) return;
+    if (rafScheduled) return;
+    rafScheduled = true;
+
+    requestAnimationFrame(() => {
+      rafScheduled = false;
+      clearTimeout(mutationDebounceTimer);
+      mutationDebounceTimer = setTimeout(() => {
+        checkAndReadNewWord();
+      }, 120);
+    });
+  }
+
+  // Chỉ quan sát childList để tránh lag khi style, canvas hoặc attribute thay đổi
+  const observer = new MutationObserver(onDOMMutation);
+  observer.observe(document.body, { childList: true, subtree: true, characterData: false, attributes: false });
+
+  // SPA Route Change Listener (khi chuyển qua bài học khác mà không reload trang)
+  let lastUrl = location.href;
+  function handleUrlChange() {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      watchedText = '';
+      lastSpokenText = '';
+      stopRepeatCycle();
+      updateWatchedWordDisplay('', '');
+      setTimeout(checkAndReadNewWord, 500);
+    }
+  }
+
+  const origPushState = history.pushState;
+  if (origPushState) {
+    history.pushState = function () {
+      origPushState.apply(this, arguments);
+      handleUrlChange();
+    };
+  }
+  const origReplaceState = history.replaceState;
+  if (origReplaceState) {
+    history.replaceState = function () {
+      origReplaceState.apply(this, arguments);
+      handleUrlChange();
+    };
+  }
+  window.addEventListener('popstate', handleUrlChange);
+
+  // ─── CSS PATH GENERATOR FOR PICK MODE ──────────────────────────────
   function getCSSPath(el) {
     const parts = [];
     while (el && el !== document.body) {
@@ -832,12 +942,12 @@
   }
 
   function getLabelFromEl(el) {
-    const text = (el.innerText || el.textContent || '').trim().slice(0, 30);
-    const cls  = [...el.classList].slice(0, 2).join('.');
+    const text = sanitizeText(el).slice(0, 30);
+    const cls  = [...el.classList].filter(c => !c.startsWith('mtr-')).slice(0, 2).join('.');
     return text || `${el.tagName.toLowerCase()}${cls ? '.' + cls : ''}`;
   }
 
-  // ─── PICK MODE ───────────────────────────────────────────────────
+  // ─── PICK MODE ─────────────────────────────────────────────────────
   function startPickMode() {
     isPickingMode = true;
     document.getElementById('mtr-fab')?.classList.add('picking');
@@ -857,70 +967,13 @@
   }
 
   function clearHighlight() {
-    if (highlightEl) { highlightEl.classList.remove('mtr-pick-highlight'); highlightEl = null; }
-  }
-
-  // ─── CHANGE DETECTION ────────────────────────────────────────────
-  function getFirstSelectorText() {
-    for (const s of config.savedSelectors) {
-      const el = document.querySelector(s.cssPath);
-      const text = el && (el.innerText || el.textContent || '').trim();
-      if (text) return text;
+    if (highlightEl) {
+      highlightEl.classList.remove('mtr-pick-highlight');
+      highlightEl = null;
     }
-    return '';
   }
 
-  function updateWatchedWordDisplay(text) {
-    const el = document.getElementById('mtr-current-word');
-    if (!el) return;
-    if (text) { el.textContent = `"${text.slice(0, 40)}"`; el.classList.add('active'); }
-    else      { el.textContent = '— chưa có từ —';          el.classList.remove('active'); }
-  }
-
-  function flashChangedFab() {
-    const fab = document.getElementById('mtr-fab');
-    if (!fab) return;
-    fab.classList.remove('changed');
-    void fab.offsetWidth;
-    fab.classList.add('changed');
-    setTimeout(() => fab.classList.remove('changed'), 600);
-  }
-
-  function handleMutationChange() {
-    if (!config.enabled || !config.autoRead || config.savedSelectors.length === 0) return;
-    const newText = getFirstSelectorText();
-    if (!newText || newText === watchedText) return;
-    watchedText = newText;
-    updateWatchedWordDisplay(newText);
-    flashChangedFab();
-    clearTimeout(changeDetectTimer);
-    changeDetectTimer = setTimeout(() => {
-      const latestText = getFirstSelectorText();
-      if (!latestText) return;
-      if (latestText !== watchedText) { watchedText = latestText; updateWatchedWordDisplay(latestText); }
-      speakWithRepeat(latestText, true);
-    }, 100);
-  }
-
-  // ─── AUTO-READ ────────────────────────────────────────────────────
-  function scheduleAutoRead() {
-    if (!config.enabled || !config.autoRead) return;
-    clearTimeout(autoReadTimer);
-    autoReadTimer = setTimeout(() => {
-      const text = getFirstSelectorText();
-      if (text && text !== lastSpokenText) {
-        watchedText = text;
-        updateWatchedWordDisplay(text);
-        setTimeout(() => speakWithRepeat(text), 300);
-      }
-    }, 600);
-  }
-
-  // ─── MUTATION OBSERVER ────────────────────────────────────────────
-  const observer = new MutationObserver(() => handleMutationChange());
-  observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-
-  // ─── TOAST ───────────────────────────────────────────────────────
+  // ─── TOAST NOTIFICATION ────────────────────────────────────────────
   let toastTimer;
   function showToast(msg) {
     const t = document.getElementById('mtr-toast');
@@ -931,7 +984,198 @@
     toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
   }
 
-  // ─── PANEL RESIZE ────────────────────────────────────────────────
+  // ─── UI BUILDER ────────────────────────────────────────────────────
+  function createUI() {
+    const toast = document.createElement('div');
+    toast.id = 'mtr-toast';
+    document.body.appendChild(toast);
+
+    const fab = document.createElement('button');
+    fab.id = 'mtr-fab';
+    fab.title = 'Memrise TTS Reader (Click để mở menu, Double click để bật/tắt)';
+    fab.innerHTML = '🔊<span class="mtr-badge"></span><span class="mtr-repeat-badge" id="mtr-fab-repeat-count"></span>';
+    if (!config.enabled) fab.classList.add('disabled');
+    document.body.appendChild(fab);
+
+    const panel = document.createElement('div');
+    panel.id = 'mtr-panel';
+    panel.innerHTML = buildPanelHTML();
+    document.body.appendChild(panel);
+
+    panel.style.width     = config.panelWidth  + 'px';
+    panel.style.maxHeight = config.panelHeight + 'px';
+
+    return { fab, panel, toast };
+  }
+
+  function buildPanelHTML() {
+    const langs = [
+      { code:'en-US', name:'🇺🇸 English (US)' },
+      { code:'en-GB', name:'🇬🇧 English (UK)' },
+      { code:'vi-VN', name:'🇻🇳 Tiếng Việt'  },
+      { code:'ja-JP', name:'🇯🇵 日本語'        },
+      { code:'ko-KR', name:'🇰🇷 한국어'         },
+      { code:'zh-CN', name:'🇨🇳 中文 (简体)'   },
+      { code:'zh-TW', name:'🇹🇼 中文 (繁體)'   },
+      { code:'fr-FR', name:'🇫🇷 Français'      },
+      { code:'de-DE', name:'🇩🇪 Deutsch'       },
+      { code:'es-ES', name:'🇪🇸 Español'       },
+      { code:'ru-RU', name:'🇷🇺 Русский'       },
+      { code:'id-ID', name:'🇮🇩 Bahasa Indonesia' },
+    ];
+    const langOptions = langs.map(l =>
+      `<option value="${l.code}" ${config.lang === l.code ? 'selected' : ''}>${l.name}</option>`
+    ).join('');
+
+    return `
+      <div id="mtr-resize-handle" title="Kéo để thay đổi kích thước panel"></div>
+      <div id="mtr-panel-header">
+        <div>
+          <div class="title">📖 Trình đọc TTS v4.0</div>
+          <div class="subtitle">Memrise Vocabulary Reader</div>
+        </div>
+        <div id="mtr-cache-status" title="Trạng thái giọng đọc">
+          <span class="dot"></span>
+          <span id="mtr-cache-label">Đang tải voices...</span>
+        </div>
+      </div>
+      <div id="mtr-panel-body">
+        <div class="mtr-row">
+          <span class="mtr-label">Bật TTS</span>
+          <label class="mtr-switch">
+            <input type="checkbox" id="mtr-toggle-enabled" ${config.enabled ? 'checked' : ''}>
+            <span class="mtr-slider"></span>
+          </label>
+          <span class="mtr-label" style="min-width:auto;margin-left:12px">Tự đọc</span>
+          <label class="mtr-switch">
+            <input type="checkbox" id="mtr-toggle-auto" ${config.autoRead ? 'checked' : ''}>
+            <span class="mtr-slider"></span>
+          </label>
+        </div>
+        <div class="mtr-row">
+          <span class="mtr-label">Ngôn ngữ</span>
+          <select id="mtr-lang" class="mtr-select">${langOptions}</select>
+        </div>
+        <div class="mtr-row">
+          <span class="mtr-label">Giọng đọc</span>
+          <select id="mtr-voice" class="mtr-select">
+            <option value="">✨ Tự động (Giọng tốt nhất)</option>
+          </select>
+        </div>
+        <div class="mtr-row">
+          <span class="mtr-label">Tốc độ</span>
+          <input type="range" id="mtr-rate" class="mtr-range" min="0.5" max="2" step="0.1" value="${config.rate}">
+          <span class="mtr-range-val" id="mtr-rate-val">${config.rate}x</span>
+        </div>
+        <div class="mtr-row">
+          <span class="mtr-label">Cao độ</span>
+          <input type="range" id="mtr-pitch" class="mtr-range" min="0.5" max="2" step="0.1" value="${config.pitch}">
+          <span class="mtr-range-val" id="mtr-pitch-val">${config.pitch}</span>
+        </div>
+        <div class="mtr-divider"></div>
+        <div class="mtr-repeat-section">
+          <div class="mtr-section-title">🔁 Lặp lại tự động</div>
+          <div class="mtr-row" style="gap:10px;">
+            <span class="mtr-label" style="min-width:54px;">Số lần</span>
+            <input type="number" id="mtr-repeat-count" class="mtr-number" min="0" max="20" value="${config.repeatCount}" placeholder="0">
+            <span style="font-size:11px;color:#64748b;flex:1;">lần (0 = tắt)</span>
+          </div>
+          <div class="mtr-row" style="gap:10px;">
+            <span class="mtr-label" style="min-width:54px;">Cách nhau</span>
+            <input type="number" id="mtr-repeat-interval" class="mtr-number" min="0.1" max="60" step="0.1" value="${config.repeatInterval}" placeholder="3">
+            <span style="font-size:11px;color:#64748b;flex:1;">giây</span>
+          </div>
+          <div id="mtr-repeat-progress-wrap">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;">
+              <span style="font-size:10px;color:#6ee7b7;">Đang chờ đọc lại...</span>
+              <span id="mtr-repeat-progress-text" style="font-size:10px;color:#6ee7b7;"></span>
+            </div>
+            <div id="mtr-repeat-progress-bar-bg">
+              <div id="mtr-repeat-progress-bar"></div>
+            </div>
+          </div>
+          <button class="mtr-btn danger" id="mtr-btn-stop-repeat" style="width:100%;justify-content:center;">
+            ⏹ Dừng lặp lại
+          </button>
+        </div>
+        <div class="mtr-change-section">
+          <div class="mtr-section-title">
+            <span>⚡ Từ vựng hiện tại</span>
+            <span id="mtr-detected-tag">Tự động</span>
+          </div>
+          <div style="font-size:11px;color:#92400e;line-height:1.4;">
+            Tự động lọc sạch phiên âm IPA, từ loại và phát hiện từ mới.
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:10px;color:#78716c;">Đang theo dõi:</span>
+            <span id="mtr-current-word">— chưa có từ —</span>
+          </div>
+        </div>
+        <div class="mtr-divider"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div style="font-size:11px;color:#94a3b8;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;">
+            📌 Vị trí tự chọn (Tuỳ chọn)
+          </div>
+        </div>
+        <div id="mtr-selector-list"></div>
+        <div class="mtr-btn-row">
+          <button class="mtr-btn" id="mtr-btn-pick">✚ Chọn vị trí</button>
+          <button class="mtr-btn" id="mtr-btn-reread" title="Đọc lại từ hiện tại (Phím R)">🔁 Đọc lại</button>
+          <button class="mtr-btn danger" id="mtr-btn-clear">🗑 Xoá vị trí</button>
+        </div>
+        <div class="mtr-divider"></div>
+        <div style="font-size:11px;color:#94a3b8;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;">
+          🔈 Thử nghiệm âm thanh
+        </div>
+        <div class="mtr-row" style="gap:6px;">
+          <input id="mtr-test-input" type="text" placeholder="Nhập từ cần phát âm..."
+            style="flex:1;background:#1e293b;border:1px solid rgba(255,255,255,0.1);border-radius:8px;
+            color:#e2e8f0;font-size:12px;padding:6px 10px;outline:none;font-family:inherit;">
+          <button class="mtr-btn" id="mtr-btn-test">▶</button>
+        </div>
+        <div style="font-size:10px;color:#475569;text-align:center;margin-top:2px;">
+          Phím tắt: R (đọc lại) · Alt+S (bật/tắt) · Alt+X (dừng) · Kéo góc ↖ để đổi cỡ
+        </div>
+      </div>
+    `;
+  }
+
+  function renderSelectorList() {
+    const list = document.getElementById('mtr-selector-list');
+    if (!list) return;
+    if (!config.savedSelectors || config.savedSelectors.length === 0) {
+      list.innerHTML = '<div class="mtr-empty">Mặc định dùng Auto-detect. Bạn có thể bấm "+ Chọn vị trí" nếu muốn chỉ định vùng riêng.</div>';
+      return;
+    }
+    list.innerHTML = config.savedSelectors.map((s, i) => `
+      <div class="mtr-selector-item" data-index="${i}">
+        <div style="flex:1;min-width:0;">
+          <div class="item-label">📌 ${escapeHTML(s.label)}</div>
+          <div class="item-selector">${escapeHTML(s.cssPath)}</div>
+        </div>
+        <button class="item-play" title="Đọc ngay" data-index="${i}">▶</button>
+        <button class="item-del"  title="Xoá"      data-index="${i}">✕</button>
+      </div>
+    `).join('');
+
+    list.querySelectorAll('.item-play').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        readSelector(config.savedSelectors[+btn.dataset.index]);
+      });
+    });
+    list.querySelectorAll('.item-del').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        config.savedSelectors.splice(+btn.dataset.index, 1);
+        saveConfig();
+        renderSelectorList();
+        showToast('🗑 Đã xoá vị trí');
+      });
+    });
+  }
+
+  // ─── PANEL RESIZE ──────────────────────────────────────────────────
   function initPanelResize(panel) {
     const handle = document.getElementById('mtr-resize-handle');
     if (!handle) return;
@@ -966,41 +1210,44 @@
       config.panelWidth  = panel.offsetWidth;
       config.panelHeight = panel.offsetHeight;
       saveConfig();
-      showToast(`📐 Kích thước: ${config.panelWidth}×${config.panelHeight}px`);
+      showToast(`📐 Đã lưu cỡ: ${config.panelWidth}×${config.panelHeight}px`);
     });
   }
 
-  // ─── INIT ─────────────────────────────────────────────────────────
+  // ─── INITIALIZATION ────────────────────────────────────────────────
   function init() {
     const { fab, panel } = createUI();
     renderSelectorList();
     preWarmVoices();
     initPanelResize(panel);
 
-    // FAB click → toggle panel
+    // FAB click -> mở/đóng panel
     fab.addEventListener('click', (e) => {
       e.stopPropagation();
       if (isPickingMode) { stopPickMode(); return; }
       panelOpen = !panelOpen;
       panel.classList.toggle('open', panelOpen);
       if (panelOpen) {
-        updateCacheStatus(allVoicesCache?.length > 0);
-        updateWatchedWordDisplay(watchedText || getFirstSelectorText());
+        updateCacheStatus(allVoicesCache && allVoicesCache.length > 0);
+        populateVoiceDropdown();
+        const cur = pickBestTextElement();
+        updateWatchedWordDisplay(cur.text || watchedText, cur.label);
       }
     });
 
-    // FAB double-click → bật/tắt nhanh
+    // FAB double-click -> bật/tắt nhanh
     fab.addEventListener('dblclick', (e) => {
       e.stopPropagation();
       config.enabled = !config.enabled;
       saveConfig();
       fab.classList.toggle('disabled', !config.enabled);
-      document.getElementById('mtr-toggle-enabled').checked = config.enabled;
+      const chk = document.getElementById('mtr-toggle-enabled');
+      if (chk) chk.checked = config.enabled;
       showToast(config.enabled ? '🔊 TTS đã bật' : '🔇 TTS đã tắt');
-      if (!config.enabled) { window.speechSynthesis.cancel(); stopRepeatCycle(); stopKeepAlive(); }
+      if (!config.enabled) stopAllSpeech();
     });
 
-    // Đóng panel khi click ngoài
+    // Đóng panel khi click bên ngoài
     document.addEventListener('click', (e) => {
       if (!panel.contains(e.target) && e.target !== fab && !isPickingMode) {
         panelOpen = false;
@@ -1008,51 +1255,68 @@
       }
     });
 
-    document.getElementById('mtr-toggle-enabled').addEventListener('change', function () {
+    // Bật/tắt TTS
+    document.getElementById('mtr-toggle-enabled')?.addEventListener('change', function () {
       config.enabled = this.checked;
       saveConfig();
       fab.classList.toggle('disabled', !config.enabled);
-      if (!config.enabled) { window.speechSynthesis.cancel(); stopRepeatCycle(); stopKeepAlive(); }
+      if (!config.enabled) stopAllSpeech();
       showToast(config.enabled ? '🔊 TTS đã bật' : '🔇 TTS đã tắt');
     });
 
-    document.getElementById('mtr-toggle-auto').addEventListener('change', function () {
+    // Bật/tắt Tự đọc
+    document.getElementById('mtr-toggle-auto')?.addEventListener('change', function () {
       config.autoRead = this.checked;
       saveConfig();
       showToast(config.autoRead ? '⚡ Tự đọc đã bật' : '⏸ Tự đọc đã tắt');
+      if (config.autoRead) checkAndReadNewWord();
     });
 
-    document.getElementById('mtr-lang').addEventListener('change', function () {
+    // Thay đổi ngôn ngữ
+    document.getElementById('mtr-lang')?.addEventListener('change', function () {
       config.lang = this.value;
+      config.voiceName = ''; // reset giọng để auto chọn giọng tốt nhất của ngôn ngữ mới
       saveConfig();
-      invalidateVoiceCache();
-      // Re-warm engine cho voice mới
+      populateVoiceDropdown();
       engineWarmedUp = false;
       warmUpEngine();
       showToast(`🌐 Ngôn ngữ: ${this.options[this.selectedIndex].text}`);
     });
 
-    document.getElementById('mtr-rate').addEventListener('input', function () {
+    // Thay đổi giọng đọc cụ thể
+    document.getElementById('mtr-voice')?.addEventListener('change', function () {
+      config.voiceName = this.value;
+      saveConfig();
+      const txt = this.value ? `🗣 Giọng: ${this.options[this.selectedIndex].text}` : '✨ Giọng: Tự động';
+      showToast(txt);
+      warmUpEngine();
+    });
+
+    // Tốc độ
+    document.getElementById('mtr-rate')?.addEventListener('input', function () {
       config.rate = parseFloat(this.value);
       document.getElementById('mtr-rate-val').textContent = config.rate + 'x';
       saveConfig();
     });
 
-    document.getElementById('mtr-pitch').addEventListener('input', function () {
+    // Cao độ
+    document.getElementById('mtr-pitch')?.addEventListener('input', function () {
       config.pitch = parseFloat(this.value);
       document.getElementById('mtr-pitch-val').textContent = config.pitch;
       saveConfig();
     });
 
-    document.getElementById('mtr-repeat-count').addEventListener('change', function () {
-      const val = Math.max(0, Math.min(20, parseInt(this.value) || 0));
+    // Số lần lặp
+    document.getElementById('mtr-repeat-count')?.addEventListener('change', function () {
+      const val = Math.max(0, Math.min(20, parseInt(this.value, 10) || 0));
       this.value = val;
       config.repeatCount = val;
       saveConfig();
       showToast(val === 0 ? '🔁 Lặp lại đã tắt' : `🔁 Sẽ lặp thêm ${val} lần`);
     });
 
-    document.getElementById('mtr-repeat-interval').addEventListener('change', function () {
+    // Khoảng cách lặp
+    document.getElementById('mtr-repeat-interval')?.addEventListener('change', function () {
       const val = Math.max(0.1, Math.min(60, parseFloat(this.value) || 3));
       this.value = val;
       config.repeatInterval = val;
@@ -1060,43 +1324,57 @@
       showToast(`⏱ Khoảng cách: ${val}s`);
     });
 
-    document.getElementById('mtr-btn-stop-repeat').addEventListener('click', () => {
-      speakGen++;
-      window.speechSynthesis.cancel();
-      stopRepeatCycle();
-      stopKeepAlive();
+    // Dừng lặp lại
+    document.getElementById('mtr-btn-stop-repeat')?.addEventListener('click', () => {
+      stopAllSpeech();
       showToast('⏹ Đã dừng lặp lại');
     });
 
-    document.getElementById('mtr-btn-test').addEventListener('click', () => {
-      const val = document.getElementById('mtr-test-input').value;
-      if (val.trim()) speakWithRepeat(val.trim(), true);
+    // Test input
+    document.getElementById('mtr-btn-test')?.addEventListener('click', () => {
+      const input = document.getElementById('mtr-test-input');
+      const val = input ? input.value.trim() : '';
+      if (val) speakWithRepeat(val, true);
       else showToast('⚠️ Nhập từ cần thử trước');
     });
 
-    document.getElementById('mtr-test-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && e.target.value.trim()) speakWithRepeat(e.target.value.trim(), true);
+    document.getElementById('mtr-test-input')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.value.trim()) {
+        speakWithRepeat(e.target.value.trim(), true);
+      }
     });
 
-    document.getElementById('mtr-btn-reread').addEventListener('click', () => {
+    // Đọc lại từ
+    document.getElementById('mtr-btn-reread')?.addEventListener('click', () => {
       reReadLast();
       showToast('🔁 Đọc lại...');
     });
 
-    document.getElementById('mtr-btn-clear').addEventListener('click', () => {
-      if (!config.savedSelectors.length) { showToast('Chưa có vị trí nào để xoá'); return; }
+    // Xoá tất cả selector
+    document.getElementById('mtr-btn-clear')?.addEventListener('click', () => {
+      if (!config.savedSelectors || !config.savedSelectors.length) {
+        showToast('Chưa có vị trí nào để xoá');
+        return;
+      }
       config.savedSelectors = [];
       saveConfig();
       renderSelectorList();
       showToast('🗑 Đã xoá tất cả vị trí');
     });
 
-    document.getElementById('mtr-btn-pick').addEventListener('click', (e) => {
+    // Nút chọn vị trí
+    document.getElementById('mtr-btn-pick')?.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (isPickingMode) stopPickMode();
-      else { startPickMode(); panelOpen = false; panel.classList.remove('open'); }
+      if (isPickingMode) {
+        stopPickMode();
+      } else {
+        startPickMode();
+        panelOpen = false;
+        panel.classList.remove('open');
+      }
     });
 
+    // Pick Mode Events
     document.addEventListener('mouseover', (e) => {
       if (!isPickingMode) return;
       if (e.target.closest('#mtr-panel') || e.target === fab) return;
@@ -1107,7 +1385,7 @@
 
     document.addEventListener('mouseout', (e) => {
       if (!isPickingMode) return;
-      if (e.target === highlightEl) e.target.classList.remove('mtr-pick-highlight');
+      if (e.target === highlightEl) clearHighlight();
     });
 
     document.addEventListener('click', (e) => {
@@ -1119,7 +1397,7 @@
       const target  = e.target;
       const cssPath = getCSSPath(target);
       const label   = getLabelFromEl(target);
-      const text    = (target.innerText || target.textContent || '').trim();
+      const text    = sanitizeText(target);
 
       if (!config.savedSelectors.some(s => s.cssPath === cssPath)) {
         config.savedSelectors.push({ label, cssPath });
@@ -1137,29 +1415,44 @@
       panel.classList.add('open');
     }, true);
 
+    // Bắt phím tắt an toàn (không xung đột ô nhập liệu)
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'r' && !e.altKey && !e.ctrlKey && document.activeElement.tagName !== 'INPUT') {
-        reReadLast();
-        showToast('🔁 Đọc lại...');
-        return;
-      }
-      if (e.altKey && e.key === 's') {
+      if (isEditableTarget(document.activeElement)) return;
+
+      if (e.altKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
         config.enabled = !config.enabled;
         saveConfig();
         fab.classList.toggle('disabled', !config.enabled);
+        const chk = document.getElementById('mtr-toggle-enabled');
+        if (chk) chk.checked = config.enabled;
         showToast(config.enabled ? '🔊 TTS đã bật' : '🔇 TTS đã tắt');
+        if (!config.enabled) stopAllSpeech();
+        return;
       }
-      if (e.altKey && e.key === 'x') {
-        speakGen++;
-        window.speechSynthesis.cancel();
-        stopRepeatCycle();
-        stopKeepAlive();
+
+      if (e.altKey && (e.key === 'x' || e.key === 'X')) {
+        e.preventDefault();
+        stopAllSpeech();
         showToast('⏹ Đã dừng (Alt+X)');
+        return;
       }
-      if (e.key === 'Escape' && isPickingMode) stopPickMode();
+
+      if (e.key === 'r' || e.key === 'R') {
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          reReadLast();
+          showToast('🔁 Đọc lại...');
+        }
+        return;
+      }
+
+      if (e.key === 'Escape' && isPickingMode) {
+        stopPickMode();
+      }
     });
 
-    setTimeout(scheduleAutoRead, 1500);
+    // Khởi động kiểm tra từ đầu tiên sau khi trang nạp
+    setTimeout(checkAndReadNewWord, 1200);
   }
 
   if (document.body) init();
